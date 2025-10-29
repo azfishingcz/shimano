@@ -105,17 +105,21 @@ def download_file(ftp, remote_path: str) -> bytes:
     ftp.retrbinary(f"RETR {name}", buf.write)
     return buf.getvalue()
 
+# nahoru k importům přidej GoogleAuth:
+from pydrive2.auth import GoogleAuth, ServiceAccountCredentials
+
 def gdrive_client():
-    try:
-        sa_json = os.environ["GDRIVE_SA_JSON"]
-    except KeyError:
-        log("ERROR: chybí secret GDRIVE_SA_JSON"); sys.exit(20)
+    # uložit JSON klíč ze secretu
+    sa_json = os.environ["GDRIVE_SA_JSON"]
     json_path = "sa.json"
     with open(json_path, "w", encoding="utf-8") as f:
         f.write(sa_json)
+
     scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(json_path, scopes)
-    return GoogleDrive(creds)
+    gauth = GoogleAuth()
+    gauth.credentials = ServiceAccountCredentials.from_json_keyfile_name(json_path, scopes)
+
+    return GoogleDrive(gauth)
 
 def upload_replace_public(drive, content: bytes, name: str, folder_id: str):
     try:
