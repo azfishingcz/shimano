@@ -1,0 +1,29 @@
+name: FTP to Google Drive
+
+on:
+  schedule:
+    - cron: "15 3 * * *"   # spouští se každý den v 03:15 UTC
+  workflow_dispatch:       # možnost ručně spustit
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pydrive2
+
+      - name: Fetch from FTP and upload to Drive
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: python fetch_and_upload.py
