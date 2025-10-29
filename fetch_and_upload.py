@@ -1,19 +1,17 @@
-import os
-import io
-import posixpath
+import os, io, posixpath
 from typing import Optional, List
+from ftplib import FTP, FTP_TLS, error_perm
 from pydrive2.auth import ServiceAccountCredentials
 from pydrive2.drive import GoogleDrive
-from ftplib import FTP, FTP_TLS, error_perm
 
 FTP_HOST = os.environ["FTP_HOST"]
 FTP_USER = os.environ["FTP_USER"]
 FTP_PASS = os.environ["FTP_PASS"]
-TARGET_BASENAME = "ArtExPPLNFBaltic.txt"   # co hledáme (case-insensitive)
 
+TARGET_BASENAME = "ArtExPPLNFBaltic.txt"   # hledaný název (case-insensitive)
 FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
-TARGET_NAME = "ArtExPPLNFBaltic.txt"      # jméno na Drive
-MAX_DEPTH = 6                              # pro jistotu hlubší průchod
+TARGET_NAME = "ArtExPPLNFBaltic.txt"       # jak se bude jmenovat na Drive
+MAX_DEPTH = 6
 
 def connect_ftp():
     try:
@@ -25,8 +23,7 @@ def connect_ftp():
         print("INFO: Connected via FTPS."); return ftps
 
 def listdir_safe(ftp, path: str) -> List[str]:
-    try:
-        return ftp.nlst(path)
+    try: return ftp.nlst(path)
     except error_perm as e:
         if "550" in str(e): return []
         raise
@@ -44,11 +41,13 @@ def find_file(ftp, start: str, target_basename: str, depth: int = 0) -> Optional
     entries = listdir_safe(ftp, start)
     normalized = [e if e.startswith("/") else posixpath.join(start, e) for e in entries]
 
+    # 1) soubory v aktuální složce
     for p in normalized:
         if posixpath.basename(p).lower() == target_basename.lower():
             print(f"INFO: Found file at {p}")
             return p
 
+    # 2) rekurze do podsložek
     for p in normalized:
         try:
             if is_dir(ftp, p):
