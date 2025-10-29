@@ -8,7 +8,7 @@ FTP_HOST = os.environ["FTP_HOST"]
 FTP_USER = os.environ["FTP_USER"]
 FTP_PASS = os.environ["FTP_PASS"]
 
-TARGET_BASENAME = "ArtExPPLNFBaltic.txt"   # co hledáme (case-insensitive)
+TARGET_BASENAME = "ArtExpPLNF_Baltic.txt"   # co hledáme (case-insensitive)
 FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
 TARGET_NAME = "ArtExPPLNFBaltic.txt"
 MAX_DEPTH = int(os.environ.get("MAX_DEPTH", "6"))
