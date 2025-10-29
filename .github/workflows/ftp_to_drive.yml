@@ -1,13 +1,17 @@
 name: FTP to Google Drive
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: "15 3 * * *"   # spouští se každý den v 03:15 UTC
-  workflow_dispatch:       # možnost ručně spustit
+    - cron: "15 3 * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"   # logy hned
+      MAX_DEPTH: "8"          # když chceš, lze upravit hloubku průchodu
+
     steps:
       - uses: actions/checkout@v4
 
@@ -18,6 +22,7 @@ jobs:
 
       - name: Install dependencies
         run: pip install pydrive2
+
       - name: Show script head (debug)
         run: |
           ls -la
