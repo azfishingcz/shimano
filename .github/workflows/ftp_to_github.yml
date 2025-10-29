@@ -1,0 +1,166 @@
+name: FTP to GitHub (feed branch)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 3 * * *"   # denně 03:15 (Prague ~ 04:15 CET/CEST rozdíl)
+
+permissions:
+  contents: write  # nutné pro push
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+      FTP_FILE_NAME: "ArtExpPLNF_Baltic.txt"   # název na FTP (jak jsme zjistili z logu)
+      TARGET_DIR: "feed"                        # složka v repu
+      TARGET_NAME: "ArtExpPLNF_Baltic.txt"      # název souboru v repu
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # ať umíme přepínat/vytvářet větev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -V
+
+      - name: Fetch file from FTP (verbose) -> save to workspace
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_FILE_NAME: ${{ env.FTP_FILE_NAME }}
+        run: |
+          python - <<'PY'
+          import os, io, posixpath, sys
+          from ftplib import FTP, FTP_TLS, error_perm, all_errors
+
+          host=os.environ["FTP_HOST"]
+          user=os.environ["FTP_USER"]
+          pw  =os.environ["FTP_PASS"]
+          target=os.environ.get("FTP_FILE_NAME","ArtExpPLNF_Baltic.txt")
+
+          def log(m): print(m, flush=True)
+
+          def try_connect(mode):
+              try:
+                  if mode=="FTP_PASV":
+                      ftp=FTP(host,timeout=60); ftp.login(user,pw); ftp.set_pasv(True); return ftp,"FTP PASV"
+                  if mode=="FTP_ACTIVE":
+                      ftp=FTP(host,timeout=60); ftp.login(user,pw); ftp.set_pasv(False); return ftp,"FTP ACTIVE"
+                  if mode=="FTPS_PASV":
+                      ftp=FTP_TLS(host,timeout=60); ftp.login(user,pw); ftp.prot_p(); ftp.set_pasv(True); return ftp,"FTPS PASV"
+                  if mode=="FTPS_ACTIVE":
+                      ftp=FTP_TLS(host,timeout=60); ftp.login(user,pw); ftp.prot_p(); ftp.set_pasv(False); return ftp,"FTPS ACTIVE"
+              except all_errors as e:
+                  raise RuntimeError(f"CONNECT_FAIL[{mode}]: {e}")
+
+          def listdir_safe(ftp, path):
+              try: return ftp.nlst(path)
+              except error_perm as e:
+                  if "550" in str(e): return []
+                  raise
+
+          def is_dir(ftp,path):
+              pwd=ftp.pwd()
+              try: ftp.cwd(path); ftp.cwd(pwd); return True
+              except error_perm: return False
+
+          def find_file(ftp,start,needle,depth=0,max_depth=6):
+              if depth>max_depth: return None
+              start="/" if not start else start
+              try: entries=listdir_safe(ftp,start)
+              except Exception as e: log(f"DIR_LIST_ERROR '{start}': {e}"); return None
+              items=[e if e.startswith("/") else posixpath.join(start,e) for e in entries]
+              for p in items:
+                  if posixpath.basename(p).lower()==needle.lower():
+                      log(f"FOUND: {p}"); return p
+              for p in items:
+                  try:
+                      if is_dir(ftp,p):
+                          f=find_file(ftp,p,needle,depth+1,max_depth)
+                          if f: return f
+                  except Exception as e:
+                      log(f"WARN skip '{p}': {e}")
+              return None
+
+          log(f"START FTP host={host} user={user} target={target}")
+          ftp=None
+          for m in ["FTP_PASV","FTP_ACTIVE","FTPS_PASV","FTPS_ACTIVE"]:
+              try:
+                  ftp,desc=try_connect(m); log("OK CONNECT: "+desc); break
+              except RuntimeError as e:
+                  log(str(e))
+          if not ftp:
+              log("ERROR: cannot connect"); sys.exit(10)
+
+          try:
+              log("PWD: "+ftp.pwd())
+              root=listdir_safe(ftp,"/"); log(f"ROOT({len(root)}): {root[:50]}")
+          except Exception as e:
+              log("ROOT_LIST_ERROR: "+str(e))
+
+          found=find_file(ftp,"/",target,0,6)
+          if not found:
+              log("ERROR: target not found"); sys.exit(11)
+
+          # stáhnout
+          dirp=posixpath.dirname(found) or "/"
+          name=posixpath.basename(found)
+          if dirp not in ("","/"):
+              ftp.cwd(dirp); log(f"CWD: {dirp}")
+          log(f"RETR: {name}")
+          buf=io.BytesIO()
+          ftp.retrbinary(f"RETR {name}", buf.write)
+          data=buf.getvalue()
+          try: ftp.quit()
+          except Exception: pass
+          log(f"OK DOWNLOAD: {len(data)} bytes")
+
+          # uložit do workspace (aktuální repo)
+          out_dir=os.environ.get("TARGET_DIR","feed")
+          out_name=os.environ.get("TARGET_NAME","ArtExpPLNF_Baltic.txt")
+          os.makedirs(out_dir, exist_ok=True)
+          out_path=os.path.join(out_dir,out_name)
+          with open(out_path,"wb") as f: f.write(data)
+          print("OUT_PATH="+out_path)
+          PY
+
+      - name: Commit & push to branch 'feed' (only if changed)
+        env:
+          TARGET_DIR: ${{ env.TARGET_DIR }}
+          TARGET_NAME: ${{ env.TARGET_NAME }}
+        run: |
+          set -e
+
+          # Přepnout / vytvořit větev feed
+          git checkout -B feed
+
+          # Přidat soubor
+          git add "${TARGET_DIR}/${TARGET_NAME}" || true
+
+          # Commit jen pokud jsou změny
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "update: ${TARGET_NAME} $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git push origin feed
+          fi
+
+      - name: Show RAW URL (use in Google Sheets)
+        env:
+          REPO: ${{ github.repository }}
+          TARGET_DIR: ${{ env.TARGET_DIR }}
+          TARGET_NAME: ${{ env.TARGET_NAME }}
+        run: |
+          echo "RAW URL:"
+          echo "https://raw.githubusercontent.com/${REPO}/feed/${TARGET_DIR}/${TARGET_NAME}"
