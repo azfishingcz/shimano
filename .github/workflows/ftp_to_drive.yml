@@ -18,6 +18,11 @@ jobs:
 
       - name: Install dependencies
         run: pip install pydrive2
+      - name: Show script head (debug)
+        run: |
+          ls -la
+          echo "===== fetch_and_upload.py (first 80 lines) ====="
+          sed -n '1,80p' fetch_and_upload.py
 
       - name: Fetch from FTP and upload to Drive
         env:
