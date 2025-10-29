@@ -1,56 +1,87 @@
 import os
-from ftplib import FTP
 import io
+import posixpath
+from typing import Optional, List
+
+# === Google Drive (upload) ===
 from pydrive2.auth import ServiceAccountCredentials
 from pydrive2.drive import GoogleDrive
+
+# === FTP / FTPS ===
+from ftplib import FTP, FTP_TLS, error_perm
 
 FTP_HOST = os.environ["FTP_HOST"]
 FTP_USER = os.environ["FTP_USER"]
 FTP_PASS = os.environ["FTP_PASS"]
-FTP_FILE = "ArtExPPLNFBaltic.txt"
+TARGET_BASENAME = "ArtExPPLNFBaltic.txt"  # co hledáme (case-insensitive)
 
 FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
-TARGET_NAME = "ArtExPPLNFBaltic.txt"  # jak se bude jmenovat na Drive
+TARGET_NAME = "ArtExPPLNFBaltic.txt"     # jak se bude jmenovat na Drive
 
-def download_from_ftp() -> bytes:
-    ftp = FTP(FTP_HOST, timeout=60)
-    ftp.login(FTP_USER, FTP_PASS)
-    buf = io.BytesIO()
-    ftp.retrbinary(f"RETR {FTP_FILE}", buf.write)
-    ftp.quit()
-    return buf.getvalue()
+MAX_DEPTH = 3  # jak hluboko procházet strom
 
-def gdrive_client():
-    sa_json = os.environ["GDRIVE_SA_JSON"]
-    json_path = "sa.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        f.write(sa_json)
-    scopes = ["https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(json_path, scopes)
-    drive = GoogleDrive(creds)
-    return drive
+def connect_ftp():
+    """
+    Zkusí obyčejné FTP, při chybě zkusí FTPS (explicit TLS).
+    Vrací přihlášenou instanci.
+    """
+    try:
+        ftp = FTP(FTP_HOST, timeout=60)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.set_pasv(True)
+        print("INFO: Connected via plain FTP.")
+        return ftp
+    except Exception as e:
+        print(f"WARN: Plain FTP failed ({e}). Trying FTPS...")
+        ftps = FTP_TLS(FTP_HOST, timeout=60)
+        ftps.login(FTP_USER, FTP_PASS)
+        ftps.prot_p()    # data connection protected
+        ftps.set_pasv(True)
+        print("INFO: Connected via FTPS.")
+        return ftps
 
-def upload_replace_public(drive, content: bytes, name: str, folder_id: str):
-    existing = drive.ListFile({
-        "q": f"'{folder_id}' in parents and name='{name}' and trashed=false"
-    }).GetList()
-    for f in existing:
-        f.Delete()
+def listdir_safe(ftp, path: str) -> List[str]:
+    """
+    Vrátí seznam položek v adresáři path (jen jména).
+    Používá NLST kvůli přenositelnosti.
+    """
+    try:
+        return ftp.nlst(path)
+    except error_perm as e:
+        # Některé servery vrací 550 i pro prázdné složky – ošetřeno
+        if "550" in str(e):
+            return []
+        raise
 
-    f = drive.CreateFile({"title": name, "parents": [{"id": folder_id}]})
-    f.SetContentString(content.decode("utf-8", errors="ignore"))
-    f.Upload()
+def is_dir(ftp, path: str) -> bool:
+    pwd = ftp.pwd()
+    try:
+        ftp.cwd(path)
+        ftp.cwd(pwd)
+        return True
+    except error_perm:
+        return False
 
-    f.InsertPermission({"type": "anyone", "role": "reader"})
-    f.FetchMetadata(fields="id,webContentLink,webViewLink")
-    print("FILE_ID=", f["id"])
-    print("DOWNLOAD_LINK=", f["webContentLink"])
-    print("VIEW_LINK=", f["webViewLink"])
+def find_file(ftp, start: str, target_basename: str, depth: int = 0) -> Optional[str]:
+    """
+    DFS prohledání FTP stromu od 'start' do hloubky MAX_DEPTH,
+    vrací plnou cestu k souboru (POSIX, např. '/folder/file.txt').
+    """
+    if depth > MAX_DEPTH:
+        return None
 
-def main():
-    data = download_from_ftp()
-    drive = gdrive_client()
-    upload_replace_public(drive, data, TARGET_NAME, FOLDER_ID)
+    # normalizace: při rootu některé servery chtějí "" místo "/"
+    start = "/" if start in ("", None) else start
 
-if __name__ == "__main__":
-    main()
+    entries = listdir_safe(ftp, start)
+    # NLST může vracet buď plná jména, nebo jen názvy – sjednotíme na plné cesty
+    normalized = []
+    for e in entries:
+        # pokud už je to plná cesta, bereme jak je, jinak připojíme ke 'start'
+        if e.startswith("/"):
+            normalized.append(e)
+        else:
+            normalized.append(posixpath.join(start, e))
+
+    # 1) Hledej soubory v aktuálním ad
+
