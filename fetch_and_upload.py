@@ -10,7 +10,7 @@ FTP_PASS = os.environ["FTP_PASS"]
 
 TARGET_BASENAME = "ArtExpPLNF_Baltic.txt"   # co hledáme (case-insensitive)
 FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
-TARGET_NAME = "ArtExPPLNFBaltic.txt"
+TARGET_NAME     = "ArtExpPLNF_Baltic.txt"
 MAX_DEPTH = int(os.environ.get("MAX_DEPTH", "6"))
 
 def log(msg: str):
@@ -122,24 +122,46 @@ def gdrive_client():
     return GoogleDrive(gauth)
 
 def upload_replace_public(drive, content: bytes, name: str, folder_id: str):
+    # 1) Smazat staré verze téhož jména v cílové složce
     try:
-        existing = drive.ListFile({"q": f"'{folder_id}' in parents and name='{name}' and trashed=false"}).GetList()
+        file_list = drive.ListFile({
+            "q": f"'{folder_id}' in parents and title='{name}' and trashed=false",
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True
+        }).GetList()
     except Exception as e:
-        log(f"DRIVE_LIST_ERROR: {e}"); sys.exit(30)
-    for f in existing:
+        log(f"DRIVE_LIST_ERROR: {e}")
+        sys.exit(30)
+
+    for f in file_list:
         try:
             f.Delete()
         except Exception as e:
             log(f"DRIVE_DELETE_WARN: {e}")
+
+    # 2) Nahrát nový soubor (binárně) do složky
     f = drive.CreateFile({"title": name, "parents": [{"id": folder_id}]})
-    f.SetContentString(content.decode("utf-8", errors="ignore"))
+
+    # Binární upload – bezpečné pro jakýkoliv obsah
+    tmp_path = "tmp_upload.bin"
+    with open(tmp_path, "wb") as tmp:
+        tmp.write(content)
+
+    f.SetContentFile(tmp_path)
     log("DRIVE_UPLOAD: uploading…")
-    f.Upload()
-    f.InsertPermission({"type": "anyone", "role": "reader"})
+    f.Upload(param={"supportsAllDrives": True})
+
+    # 3) Veřejný přístup na odkaz
+    try:
+        f.InsertPermission({"type": "anyone", "role": "reader"})
+    except Exception as e:
+        log(f"DRIVE_PERMISSION_WARN: {e}")
+
     f.FetchMetadata(fields="id,webContentLink,webViewLink")
     log(f"FILE_ID= {f['id']}")
     log(f"DOWNLOAD_LINK= {f['webContentLink']}")
     log(f"VIEW_LINK= {f['webViewLink']}")
+
 
 def main():
     log(f"START: host={FTP_HOST}, user={FTP_USER}, target={TARGET_BASENAME}, depth={MAX_DEPTH}")
