@@ -1,9 +1,9 @@
-name: Update Shimano FTP feed (robust)
+name: Update Shimano FTP feed (bulletproof)
 
 on:
   schedule:
     - cron: "0 2 * * *"   # denně 02:00 UTC (~03:00 Praha v CET)
-  workflow_dispatch:      # ruční spuštění
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,6 +21,7 @@ jobs:
       TARGET_DIR: "feed"                      # složka v repu
       TARGET_NAME: "ArtExpPLNF_Baltic.txt"    # název v repu
       TMP_FILE: "tmp_download.txt"
+      MIN_BYTES: "10000"                      # minimální velikost (10 kB) aby se necommtoval prázdný/rozbitý soubor
 
     steps:
       - name: Checkout repo (full history)
@@ -81,24 +82,34 @@ jobs:
               ftp.retrbinary(f"RETR {name}", buf.write)
           except all_errors as e:
               log(f"RETR_FAIL: {e}")
-              try:
-                  ftp.quit()
-              except Exception:
-                  pass
+              try: ftp.quit()
+              except Exception: pass
               sys.exit(11)
 
           data = buf.getvalue()
-          with open(outp, "wb") as f:
-              f.write(data)
+          with open(outp, "wb") as f: f.write(data)
           log(f"OK DOWNLOAD: {len(data)} bytes -> {outp}")
 
-          try:
-              ftp.quit()
-          except Exception:
-              pass
+          try: ftp.quit()
+          except Exception: pass
           PY
 
-      - name: Prepare feed branch and decide if changed
+      - name: Sanity check of downloaded file (size & preview)
+        id: sanity
+        env:
+          TMP_FILE: ${{ env.TMP_FILE }}
+          MIN_BYTES: ${{ env.MIN_BYTES }}
+        run: |
+          set -e
+          BYTES=$(wc -c < "${TMP_FILE}" | tr -d ' ')
+          echo "Downloaded size: ${BYTES} bytes"
+          if [ "${BYTES}" -lt "${MIN_BYTES}" ]; then
+            echo "ERROR: File too small (< ${MIN_BYTES} bytes). Probably incomplete feed; aborting."
+            exit 20
+          fi
+          echo "first_line=$(head -n1 "${TMP_FILE}" | tr -d '\r' | cut -c1-200)" >> $GITHUB_OUTPUT
+
+      - name: Prepare feed branch & change detection
         id: prep
         env:
           TARGET_DIR: ${{ env.TARGET_DIR }}
@@ -121,13 +132,16 @@ jobs:
               git checkout -b feed origin/feed
             fi
           else
-            git checkout -b feed
+            # Orphan branch to avoid history issues on first creation
+            git checkout --orphan feed
+            git rm -rf . || true
+            git commit --allow-empty -m "init feed branch"
           fi
 
           mkdir -p "${TARGET_DIR}"
           DEST="${TARGET_DIR}/${TARGET_NAME}"
 
-          # Compute checksums (if old file exists)
+          # Compute checksums to skip no-op commits
           NEW_SHA=$(sha256sum "${TMP_FILE}" | awk '{print $1}')
           if [ -f "${DEST}" ]; then
             OLD_SHA=$(sha256sum "${DEST}" | awk '{print $1}')
@@ -139,7 +153,7 @@ jobs:
           echo "old_sha=${OLD_SHA}" >> $GITHUB_OUTPUT
 
           if [ "${NEW_SHA}" = "${OLD_SHA}" ]; then
-            echo "No content change detected. Skipping commit."
+            echo "No content change detected — skipping commit."
             echo "changed=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -148,24 +162,18 @@ jobs:
           git add "${DEST}"
           echo "changed=true" >> $GITHUB_OUTPUT
 
-      - name: Commit & push (robust with retries)
+      - name: Commit & push (rebase + retries + last-resort force-with-lease)
         if: steps.prep.outputs.changed == 'true'
         env:
           TARGET_DIR: ${{ env.TARGET_DIR }}
           TARGET_NAME: ${{ env.TARGET_NAME }}
         run: |
           set -e
-
           git commit -m "update: ${TARGET_NAME} $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 
-          # Up to 5 attempts:
-          # 1-3: normal push with rebase pull on rejection
-          # 4:   rebase again and try push
-          # 5:   last resort: --force-with-lease
           attempt=1
           while [ $attempt -le 5 ]; do
             echo "Push attempt #$attempt"
-
             if git push origin feed; then
               echo "Push OK"
               break
@@ -178,7 +186,6 @@ jobs:
             if [ $attempt -eq 4 ]; then
               echo "Last normal retry failed, next try will use --force-with-lease."
             fi
-
             if [ $attempt -eq 5 ]; then
               echo "Using --force-with-lease (last resort)"
               git push --force-with-lease origin feed
@@ -187,8 +194,7 @@ jobs:
             fi
 
             attempt=$((attempt+1))
-            # exponenciální backoff
-            sleep $((attempt*2))
+            sleep $((attempt*2))  # backoff
           done
 
       - name: Print RAW URL for Sheets
