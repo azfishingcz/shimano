@@ -1,162 +1,197 @@
-name: FTP to GitHub (feed branch)
+name: Update Shimano FTP feed (robust)
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "15 3 * * *"   # denně 03:15 (Prague ~ 04:15 CET/CEST rozdíl)
+    - cron: "0 2 * * *"   # denně 02:00 UTC (~03:00 Praha v CET)
+  workflow_dispatch:      # ruční spuštění
 
 permissions:
-  contents: write  # nutné pro push
+  contents: write
+
+concurrency:
+  group: azfishingcz-shimano-feed
+  cancel-in-progress: true
 
 jobs:
-  run:
+  fetch_and_commit:
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: "1"
-      FTP_FILE_NAME: "ArtExpPLNF_Baltic.txt"   # název na FTP (jak jsme zjistili z logu)
-      TARGET_DIR: "feed"                        # složka v repu
-      TARGET_NAME: "ArtExpPLNF_Baltic.txt"      # název souboru v repu
+      FTP_FILE_NAME: "ArtExpPLNF_Baltic.txt"  # název na FTP
+      TARGET_DIR: "feed"                      # složka v repu
+      TARGET_NAME: "ArtExpPLNF_Baltic.txt"    # název v repu
+      TMP_FILE: "tmp_download.txt"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo (full history)
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # ať umíme přepínat/vytvářet větev
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: |
-          python -V
-
-      - name: Fetch file from FTP (verbose) -> save to workspace
+      - name: Download file from FTP (FTP→FTPS fallback)
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASS: ${{ secrets.FTP_PASS }}
-          FTP_FILE_NAME: ${{ env.FTP_FILE_NAME }}
         run: |
           python - <<'PY'
-          import os, io, posixpath, sys
-          from ftplib import FTP, FTP_TLS, error_perm, all_errors
+          import os, io, sys
+          from ftplib import FTP, FTP_TLS, all_errors
 
-          host=os.environ["FTP_HOST"]
-          user=os.environ["FTP_USER"]
-          pw  =os.environ["FTP_PASS"]
-          target=os.environ.get("FTP_FILE_NAME","ArtExpPLNF_Baltic.txt")
+          host = os.environ["FTP_HOST"]
+          user = os.environ["FTP_USER"]
+          pw   = os.environ["FTP_PASS"]
+          name = os.environ["FTP_FILE_NAME"]
+          outp = os.environ["TMP_FILE"]
 
-          def log(m): print(m, flush=True)
+          def log(x): print(x, flush=True)
 
-          def try_connect(mode):
+          def try_mode(mode):
               try:
-                  if mode=="FTP_PASV":
-                      ftp=FTP(host,timeout=60); ftp.login(user,pw); ftp.set_pasv(True); return ftp,"FTP PASV"
-                  if mode=="FTP_ACTIVE":
-                      ftp=FTP(host,timeout=60); ftp.login(user,pw); ftp.set_pasv(False); return ftp,"FTP ACTIVE"
-                  if mode=="FTPS_PASV":
-                      ftp=FTP_TLS(host,timeout=60); ftp.login(user,pw); ftp.prot_p(); ftp.set_pasv(True); return ftp,"FTPS PASV"
-                  if mode=="FTPS_ACTIVE":
-                      ftp=FTP_TLS(host,timeout=60); ftp.login(user,pw); ftp.prot_p(); ftp.set_pasv(False); return ftp,"FTPS ACTIVE"
+                  if mode == "FTP_PASV":
+                      ftp = FTP(host, timeout=60); ftp.login(user, pw); ftp.set_pasv(True); return ftp, mode
+                  if mode == "FTPS_PASV":
+                      ftp = FTP_TLS(host, timeout=60); ftp.login(user, pw); ftp.prot_p(); ftp.set_pasv(True); return ftp, mode
+                  if mode == "FTP_ACTIVE":
+                      ftp = FTP(host, timeout=60); ftp.login(user, pw); ftp.set_pasv(False); return ftp, mode
+                  if mode == "FTPS_ACTIVE":
+                      ftp = FTP_TLS(host, timeout=60); ftp.login(user, pw); ftp.prot_p(); ftp.set_pasv(False); return ftp, mode
               except all_errors as e:
-                  raise RuntimeError(f"CONNECT_FAIL[{mode}]: {e}")
+                  log(f"CONNECT_FAIL[{mode}]: {e}")
+              return None, mode
 
-          def listdir_safe(ftp, path):
-              try: return ftp.nlst(path)
-              except error_perm as e:
-                  if "550" in str(e): return []
-                  raise
-
-          def is_dir(ftp,path):
-              pwd=ftp.pwd()
-              try: ftp.cwd(path); ftp.cwd(pwd); return True
-              except error_perm: return False
-
-          def find_file(ftp,start,needle,depth=0,max_depth=6):
-              if depth>max_depth: return None
-              start="/" if not start else start
-              try: entries=listdir_safe(ftp,start)
-              except Exception as e: log(f"DIR_LIST_ERROR '{start}': {e}"); return None
-              items=[e if e.startswith("/") else posixpath.join(start,e) for e in entries]
-              for p in items:
-                  if posixpath.basename(p).lower()==needle.lower():
-                      log(f"FOUND: {p}"); return p
-              for p in items:
-                  try:
-                      if is_dir(ftp,p):
-                          f=find_file(ftp,p,needle,depth+1,max_depth)
-                          if f: return f
-                  except Exception as e:
-                      log(f"WARN skip '{p}': {e}")
-              return None
-
-          log(f"START FTP host={host} user={user} target={target}")
-          ftp=None
-          for m in ["FTP_PASV","FTP_ACTIVE","FTPS_PASV","FTPS_ACTIVE"]:
-              try:
-                  ftp,desc=try_connect(m); log("OK CONNECT: "+desc); break
-              except RuntimeError as e:
-                  log(str(e))
+          log(f"START: host={host} user={user} target={name}")
+          ftp = None
+          for m in ["FTP_PASV","FTPS_PASV","FTP_ACTIVE","FTPS_ACTIVE"]:
+              ftp, used = try_mode(m)
+              if ftp:
+                  log(f"OK CONNECT: {used}")
+                  break
           if not ftp:
-              log("ERROR: cannot connect"); sys.exit(10)
+              log("ERROR: Cannot connect FTP/FTPS in any mode.")
+              sys.exit(10)
+
+          buf = io.BytesIO()
+          try:
+              ftp.retrbinary(f"RETR {name}", buf.write)
+          except all_errors as e:
+              log(f"RETR_FAIL: {e}")
+              try:
+                  ftp.quit()
+              except Exception:
+                  pass
+              sys.exit(11)
+
+          data = buf.getvalue()
+          with open(outp, "wb") as f:
+              f.write(data)
+          log(f"OK DOWNLOAD: {len(data)} bytes -> {outp}")
 
           try:
-              log("PWD: "+ftp.pwd())
-              root=listdir_safe(ftp,"/"); log(f"ROOT({len(root)}): {root[:50]}")
-          except Exception as e:
-              log("ROOT_LIST_ERROR: "+str(e))
-
-          found=find_file(ftp,"/",target,0,6)
-          if not found:
-              log("ERROR: target not found"); sys.exit(11)
-
-          # stáhnout
-          dirp=posixpath.dirname(found) or "/"
-          name=posixpath.basename(found)
-          if dirp not in ("","/"):
-              ftp.cwd(dirp); log(f"CWD: {dirp}")
-          log(f"RETR: {name}")
-          buf=io.BytesIO()
-          ftp.retrbinary(f"RETR {name}", buf.write)
-          data=buf.getvalue()
-          try: ftp.quit()
-          except Exception: pass
-          log(f"OK DOWNLOAD: {len(data)} bytes")
-
-          # uložit do workspace (aktuální repo)
-          out_dir=os.environ.get("TARGET_DIR","feed")
-          out_name=os.environ.get("TARGET_NAME","ArtExpPLNF_Baltic.txt")
-          os.makedirs(out_dir, exist_ok=True)
-          out_path=os.path.join(out_dir,out_name)
-          with open(out_path,"wb") as f: f.write(data)
-          print("OUT_PATH="+out_path)
+              ftp.quit()
+          except Exception:
+              pass
           PY
 
-      - name: Commit & push to branch 'feed' (only if changed)
+      - name: Prepare feed branch and decide if changed
+        id: prep
+        env:
+          TARGET_DIR: ${{ env.TARGET_DIR }}
+          TARGET_NAME: ${{ env.TARGET_NAME }}
+          TMP_FILE: ${{ env.TMP_FILE }}
+        run: |
+          set -e
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch remote refs
+          git fetch origin --prune
+
+          # Switch/create local feed branch from remote if exists
+          if git ls-remote --exit-code --heads origin feed >/dev/null 2>&1; then
+            if git show-ref --verify --quiet refs/heads/feed; then
+              git checkout feed
+            else
+              git checkout -b feed origin/feed
+            fi
+          else
+            git checkout -b feed
+          fi
+
+          mkdir -p "${TARGET_DIR}"
+          DEST="${TARGET_DIR}/${TARGET_NAME}"
+
+          # Compute checksums (if old file exists)
+          NEW_SHA=$(sha256sum "${TMP_FILE}" | awk '{print $1}')
+          if [ -f "${DEST}" ]; then
+            OLD_SHA=$(sha256sum "${DEST}" | awk '{print $1}')
+          else
+            OLD_SHA="__missing__"
+          fi
+
+          echo "new_sha=${NEW_SHA}" >> $GITHUB_OUTPUT
+          echo "old_sha=${OLD_SHA}" >> $GITHUB_OUTPUT
+
+          if [ "${NEW_SHA}" = "${OLD_SHA}" ]; then
+            echo "No content change detected. Skipping commit."
+            echo "changed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          mv -f "${TMP_FILE}" "${DEST}"
+          git add "${DEST}"
+          echo "changed=true" >> $GITHUB_OUTPUT
+
+      - name: Commit & push (robust with retries)
+        if: steps.prep.outputs.changed == 'true'
         env:
           TARGET_DIR: ${{ env.TARGET_DIR }}
           TARGET_NAME: ${{ env.TARGET_NAME }}
         run: |
           set -e
 
-          # Přepnout / vytvořit větev feed
-          git checkout -B feed
+          git commit -m "update: ${TARGET_NAME} $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 
-          # Přidat soubor
-          git add "${TARGET_DIR}/${TARGET_NAME}" || true
+          # Up to 5 attempts:
+          # 1-3: normal push with rebase pull on rejection
+          # 4:   rebase again and try push
+          # 5:   last resort: --force-with-lease
+          attempt=1
+          while [ $attempt -le 5 ]; do
+            echo "Push attempt #$attempt"
 
-          # Commit jen pokud jsou změny
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git config user.name  "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "update: ${TARGET_NAME} $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git push origin feed
-          fi
+            if git push origin feed; then
+              echo "Push OK"
+              break
+            fi
 
-      - name: Show RAW URL (use in Google Sheets)
+            echo "Push rejected. Fetch & rebase, then retry..."
+            git fetch origin --prune || true
+            git pull --rebase origin feed || true
+
+            if [ $attempt -eq 4 ]; then
+              echo "Last normal retry failed, next try will use --force-with-lease."
+            fi
+
+            if [ $attempt -eq 5 ]; then
+              echo "Using --force-with-lease (last resort)"
+              git push --force-with-lease origin feed
+              echo "Push forced OK"
+              break
+            fi
+
+            attempt=$((attempt+1))
+            # exponenciální backoff
+            sleep $((attempt*2))
+          done
+
+      - name: Print RAW URL for Sheets
         env:
           REPO: ${{ github.repository }}
           TARGET_DIR: ${{ env.TARGET_DIR }}
